@@ -2,7 +2,7 @@
 name = "vlm-from-scratch"
 version = "0.1.0"
 description = ""
-authors = ["Vladislav Vinokurov <vvi@terraquantum.swiss>"]
+authors = []
 readme = "README.md"
 
 [tool.poetry.dependencies]
