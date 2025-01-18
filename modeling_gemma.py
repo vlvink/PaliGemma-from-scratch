@@ -1,10 +1,46 @@
 import torch
-from torch import nn
-from typing import Optional, Tuple, List
+from torch import nn, Tensor
+from typing import Optional, Tuple, List, Any
 from torch.nn import CrossEntropyLoss
 import math
 from modeling_siglip import SiglipVisionConfig, SiglipVisionModel
 from processing_paligemma import normalize
+
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+class KVCache():
+    def __init__(self) -> None:
+        self.key_cache: List[torch.Tensor] = []
+        self.value_cache: List[torch.Tensor] = []
+
+    def num_items(self) -> int:
+        if len(self.key_cache) == 0:
+            return 0
+        else:
+            # Shape is [Batch_size, Num_Heads_KV, Seq_len, Head_dim]
+            return self.key_cache[0].shape[-2]
+
+    def update(
+            self,
+            key_states: torch.Tensor,
+            value_states: torch.Tensor,
+            layer_idx: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if len(self.key_cache) <= layer_idx:
+            # If we never added anything to the KV-Cache of this layer, let's create it.
+            self.key_cache.append(key_states)
+            self.value_cache.append(value_states)
+        else:
+            self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states], dim=-2)
+            self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states], dim=-2)
+
+        return self.key_cache[layer_idx], self.value_cache[layer_idx]
 
 
 class GemmaConfig():
@@ -87,6 +123,145 @@ class GemmaRMSNorm(nn.Module):
         output = self._norm(x.float())
         output = output * (1.0 + self.weight.float())
         return output.type_as(x)
+
+
+class GemmaMLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+
+    def forward(self, x):
+        return self.down_proj(nn.functional.gelu(self.gate_proj(x), approximate="tanh") * self.up_proj(x))
+
+
+class GemmaAttention(nn.Module):
+    def __init__(self, config: GemmaConfig, layer_idx: Optional[int] = None):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+
+        self.attention_dropout = config.attention_dropout
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = config.head_dim
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.max_position_embeddings = config.max_position_embeddings
+        self.rope_theta = config.rope_theta
+        self.is_causal = True
+
+        assert self.hidden_size % self.num_heads == 0
+
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads*self.head_dim, bias=config.attention_bias)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads*self.head_dim, bias=config.attention_bias)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads*self.head_dim, bias=config.attention_bias)
+        self.o_proj = nn.Linear(self.num_heads*self.head_dim, self.hidden_size, bias=config.attention_bias)
+        self.rotary_emb = GemmaRotaryEmbedding(
+            self.head_dim,
+            max_position_embeddings=self.max_position_embeddings,
+            base=self.rope_theta,
+        )
+
+    def forward(
+            self,
+            hidden_states: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            kv_cache: Optional[KVCache] = None,
+            **kwargs,
+    ) -> tuple[Any, Tensor]:
+        bsz, q_len, _ = hidden_states.size() # [Batch_size, Seq_len, Hidden_size]
+        # [Batch_size, Seq_len, Num_Heads_Q * Head_dim]
+        query_states = self.q_proj(hidden_states)
+        # [Batch_size, Seq_len, Num_Heads_KV * Head_dim]
+        key_states = self.k_proj(hidden_states)
+        # [Batch_size, Seq_len, Num_Heads_KV * Head_dim]
+        value_states = self.v_proj(hidden_states)
+        # [Batch_size, Num_Heads_Q, Seq_len, Head_dim]
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        # [Batch_size, Num_Heads_KV, Seq_len, Head_dim]
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        # [Batch_size, Num_Heads_KV, Seq_len, Head_dim]
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        # [Batch_size, Seq_len, Head_dim], [Batch_size, Seq_len, Head_dim]
+        cos, sin = self.rotary_emb(query_states, position_ids, seq_len=None)
+        # [Batch_size, Num_Heads_Q, Seq_len, Head_dim], [Batch_size, Num_Heads_KV, Seq_len, Head_dim]
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        if kv_cache is not None:
+            key_states, value_states = kv_cache.update(key_states, value_states, self.layer_idx)
+
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+
+        assert attention_mask is not None
+        attn_weights = attn_weights + attention_mask
+
+        # Apply the softmax
+        # [Batch_size, Num_Heads_Q, Seq_len_Q, Seq_len_KV]
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        # Apply the dropout
+        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+        # Multiply by the values. [Batch_size, Num_Heads_Q, Seq_len_Q, Seq_len_KV] x [Batch_size, Num_Heads_KV, Seq_len_KV, Head_dim] -> [Batch_Size, Num_Heads_Q, Seq_Len_Q, Head_Dim]
+        attn_output = torch.matmul(attn_weights, value_states)
+
+        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+            raise ValueError(
+                f"'attn_output' should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is {attn_output.size()} "
+            )
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.view(bsz, q_len, -1)
+
+        # Multiply by W.o [Batch_size, Seq_len_Q, Hidden_size]
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights
+
+
+class GemmaDecoderLayer(nn.Module):
+    def __init__(self, config: GemmaConfig, layer_idx: int):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+
+        self.self_attn = GemmaAttention(config=config, layer_idx=layer_idx)
+
+        self.mlp = GemmaMLP(config)
+        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+            self,
+            hidden_states: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            kv_cache: Optional[KVCache] = None,
+    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        residual = hidden_states
+        # [Batch_size, Seq_len, Hidden_size]
+        hidden_states = self.input_layernorm(hidden_states)
+        # [Batch_size, Seq_len, Hidden_size]
+        hidden_states, _ = self.self_attn(hidden_states=hidden_states,
+                                          attention_mask=attention_mask,
+                                          position_ids=position_ids,
+                                          kv_cache=kv_cache)
+        # [Batch_size, Seq_len, Hidden_size]
+        hidden_states = hidden_states + residual
+        residual = hidden_states
+        # [Batch_size, Seq_len, Hidden_size]
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        # [Batch_size, Seq_len, Hidden_size]
+        hidden_states = self.mlp(hidden_states)
+        # [Batch_size, Seq_len, Hidden_size]
+        hidden_states = hidden_states + residual
+        return hidden_states
 
 
 class GemmaModel(nn.Module):
