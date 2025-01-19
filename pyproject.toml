@@ -10,6 +10,8 @@ python = "^3.11"
 torch = "^2.5.1"
 numpy = "^2.2.1"
 pillow = "^11.1.0"
+fire = "^0.7.0"
+transformers = "^4.48.0"
 
 
 [build-system]
