@@ -78,6 +78,16 @@ def test_inference(
         generated_tokens.append(next_token)
         if next_token.item() == stop_token:
             break
+        # Append the next token to the input
+        input_ids = next_token.unsqueeze(-1)
+        attention_mask = torch.cat(
+            [attention_mask, torch.ones((1, 1), device=input_ids.device)], dim=-1
+        )
+        generated_tokens = torch.cat(generated_tokens, dim=-1)
+        # Decode the generated tokens
+        decoded = processor.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+
+        print(prompt + decoded)
 
 def main(
         model_path: str = None,
